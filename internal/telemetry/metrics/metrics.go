@@ -12,7 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-type Option struct {
+type Options struct {
 	HealthPath      string
 	MetricsPath     string
 	ListenerAddress string
@@ -22,10 +22,10 @@ type Server struct {
 	listener net.Listener
 	httpServ *http.Server
 	isReady  atomic.Bool
-	opts     Option
+	opts     Options
 }
 
-func NewMetricsServer(opts Option) *Server {
+func NewMetricsServer(opts Options) *Server {
 	return &Server{
 		opts: opts,
 	}
@@ -54,7 +54,7 @@ func (s *Server) mux() http.Handler {
 	return mux
 }
 
-func (s *Server) start(ctx context.Context) error {
+func (s *Server) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.opts.ListenerAddress)
 
 	if err != nil {
@@ -84,4 +84,12 @@ func (s *Server) start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+func (s *Server) Addr() string {
+	if s.listener == nil {
+		return ""
+	}
+
+	return s.listener.Addr().String()
 }
