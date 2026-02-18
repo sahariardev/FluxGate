@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/sahariardev/fluxGate/internal/codel"
+	"github.com/sahariardev/fluxGate/internal/telemetry/logging"
+	"go.uber.org/zap"
 )
 
 type Item struct {
@@ -26,8 +28,9 @@ type ClassQueue struct {
 	class      string
 	limit      int
 
-	close bool
-	mu    sync.Mutex
+	close  bool
+	mu     sync.Mutex
+	logger *zap.Logger
 }
 
 type QueueParams struct {
@@ -37,7 +40,7 @@ type QueueParams struct {
 	CoDelInterval time.Duration
 }
 
-func New(p QueueParams) *ClassQueue {
+func New(p QueueParams, logger *zap.Logger) *ClassQueue {
 	if p.Limit < 0 {
 		p.Limit = 0
 	}
@@ -48,7 +51,12 @@ func New(p QueueParams) *ClassQueue {
 		limit:      p.Limit,
 		controller: codel.NewController(p.CoDelTarget, p.CoDelInterval),
 		close:      false,
+		logger:     logging.WithComonent(logger, "queue."+p.Class),
 	}
+
+	q.logger.Info("queue created", zap.Int("limit", p.Limit),
+		zap.Duration("codel_target", p.CoDelTarget),
+		zap.Duration("codel_interval", p.CoDelInterval))
 
 	Depth.WithLabelValues(p.Class).Set(0)
 
@@ -62,6 +70,7 @@ func (cq *ClassQueue) Enqueue(item Item) bool {
 
 	if cq.close {
 		DropTotals.WithLabelValues(cq.class, string(DropOverFlow)).Inc()
+		cq.logger.Warn("queue closed, enqueue rejected")
 		return false
 	}
 
@@ -92,6 +101,7 @@ func (cq *ClassQueue) Dequeue(now time.Time) (Item, DropReason, bool) {
 
 	if cq.controller.ShouldDrop(soj) {
 		DropTotals.WithLabelValues(cq.class, string(DropCoDel)).Inc()
+		cq.logger.Warn("item dropped by CoDel", zap.Duration("sojurn", soj))
 
 		return Item{}, DropCoDel, false
 	}
@@ -107,11 +117,14 @@ func (cq *ClassQueue) ReQueue(item Item) {
 
 	if cq.close {
 		DropTotals.WithLabelValues(cq.class, string(DropOverFlow)).Inc()
+		cq.logger.Warn("requeue rejected, queue closed")
+
 		return
 	}
 
 	if cq.limit == cq.items.Len() {
 		DropTotals.WithLabelValues(cq.class, string(DropOverFlow)).Inc()
+		cq.logger.Warn("requeue rejected, queue full", zap.Int("limit", cq.limit))
 		return
 	}
 
@@ -133,6 +146,9 @@ func (cq *ClassQueue) Close() []Item {
 		items = append(items, it)
 	}
 
+	cq.logger.Info("queue closed", zap.Int("drained_items", len(items)))
+
+	cq.items.Init()
 	return items
 }
 
