@@ -11,6 +11,7 @@ import (
 )
 
 type Item struct {
+	Class    string
 	Conn     any
 	EnquedAt time.Time
 }
