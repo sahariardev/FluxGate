@@ -62,7 +62,7 @@ func FromContext(ctx context.Context, fallback *zap.Logger) *zap.Logger {
 	return fallback
 }
 
-func WithComonent(logger *zap.Logger, component string) *zap.Logger {
+func WithComponent(logger *zap.Logger, component string) *zap.Logger {
 	if component == "" {
 		return logger
 	}
