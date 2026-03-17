@@ -37,7 +37,7 @@ func NewScheduler(cfg Config, logger *zap.Logger) *Scheduler {
 		cfg.Classes = []string{"gold", "standard", "background"}
 	}
 
-	l := logging.WithComonent(logger, "scheduler")
+	l := logging.WithComponent(logger, "scheduler")
 	l.Info("scheduler created",
 		zap.Strings("classes", cfg.Classes),
 		zap.Any("weights", cfg.Weights),
@@ -110,10 +110,10 @@ func (s *Scheduler) NoteAdmit(cls string) {
 	s.logger.Debug("admitted", zap.String("class", cls), zap.Int64("total", s.totalAdmits))
 }
 
-func (s *Scheduler) Next(queues map[string]ClassQueue, now time.Time) (Item, bool, bool) {
+func (s *Scheduler) Next(queues map[string]*ClassQueue, now time.Time) (Item, bool, bool) {
 	nonEmpty := map[string]bool{}
 
-	for cls, q := range queues{
+	for cls, q := range queues {
 		if q.Len() > 0 {
 			nonEmpty[cls] = true
 		}
@@ -132,7 +132,7 @@ func (s *Scheduler) Next(queues map[string]ClassQueue, now time.Time) (Item, boo
 	queue := queues[cls]
 
 	it, reason, ok := queue.Dequeue(now)
-	
+
 	if !ok && reason == DropCoDel {
 		s.logger.Warn("coDel drop during scheduling", zap.String("class", cls))
 		return Item{Class: cls}, false, true

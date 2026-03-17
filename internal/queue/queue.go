@@ -12,47 +12,46 @@ import (
 
 type Item struct {
 	Class    string
+	Enqueued time.Time
 	Conn     any
-	EnquedAt time.Time
 }
 
 type DropReason string
 
 const (
-	DropOverFlow DropReason = "overflow"
-	DropCoDel    DropReason = "codel"
+	DropOverflow DropReason = "Overflow"
+	DropCoDel    DropReason = "CoDel"
 )
 
 type ClassQueue struct {
-	items      *list.List
-	controller *codel.Controller
-	class      string
-	limit      int
+	class string
+	limit int
 
-	close  bool
+	ll     *list.List
 	mu     sync.Mutex
+	cdl    *codel.Controller
+	close  bool
 	logger *zap.Logger
 }
 
-type QueueParams struct {
+type Params struct {
 	Class         string
 	Limit         int
 	CoDelTarget   time.Duration
 	CoDelInterval time.Duration
 }
 
-func New(p QueueParams, logger *zap.Logger) *ClassQueue {
+func New(p Params, logger *zap.Logger) *ClassQueue {
 	if p.Limit < 0 {
 		p.Limit = 0
 	}
 
 	q := &ClassQueue{
-		items:      list.New(),
-		class:      p.Class,
-		limit:      p.Limit,
-		controller: codel.NewController(p.CoDelTarget, p.CoDelInterval),
-		close:      false,
-		logger:     logging.WithComonent(logger, "queue."+p.Class),
+		class:  p.Class,
+		limit:  p.Limit,
+		ll:     list.New(),
+		cdl:    codel.NewController(p.CoDelTarget, p.CoDelInterval),
+		logger: logging.WithComponent(logger, "queue."+p.Class),
 	}
 
 	q.logger.Info("queue created", zap.Int("limit", p.Limit),
@@ -60,106 +59,90 @@ func New(p QueueParams, logger *zap.Logger) *ClassQueue {
 		zap.Duration("codel_interval", p.CoDelInterval))
 
 	Depth.WithLabelValues(p.Class).Set(0)
-
 	return q
 }
 
-func (cq *ClassQueue) Enqueue(item Item) bool {
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	defer cq.refreshDeptMetrics()
+func (q *ClassQueue) Enqueue(e Item) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-	if cq.close {
-		DropTotals.WithLabelValues(cq.class, string(DropOverFlow)).Inc()
-		cq.logger.Warn("queue closed, enqueue rejected")
+	if q.close {
+		DropsTotal.WithLabelValues(q.class, string(DropOverflow)).Inc()
+		q.logger.Warn("enqueue rejected, queue closed")
 		return false
 	}
-
-	if cq.limit == cq.items.Len() {
-		DropTotals.WithLabelValues(cq.class, string(DropOverFlow)).Inc()
-		return false
-	}
-
-	cq.items.PushBack(item)
-
+	q.ll.PushBack(e)
+	Depth.WithLabelValues(q.class).Set(float64(q.ll.Len()))
 	return true
 }
 
-func (cq *ClassQueue) Dequeue(now time.Time) (Item, DropReason, bool) {
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	defer cq.refreshDeptMetrics()
+func (q *ClassQueue) Dequeue(now time.Time) (Item, DropReason, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-	if cq.items.Len() == 0 {
+	if q.ll.Len() == 0 {
 		return Item{}, "", false
 	}
 
-	cq.controller.BeginInterval(now)
-	item := cq.items.Front().Value.(Item)
-	cq.items.Remove(cq.items.Front())
-	soj := now.Sub(item.EnquedAt)
-	cq.controller.TakeNote(soj)
+	q.cdl.BeginInterval(now)
+	front := q.ll.Front()
+	it := front.Value.(Item)
+	soj := now.Sub(it.Enqueued.Local())
+	q.cdl.TakeNote(soj)
 
-	if cq.controller.ShouldDrop(soj) {
-		DropTotals.WithLabelValues(cq.class, string(DropCoDel)).Inc()
-		cq.logger.Warn("item dropped by CoDel", zap.Duration("sojurn", soj))
-
-		return Item{}, DropCoDel, false
+	if q.cdl.ShouldDrop(soj) {
+		q.ll.Remove(front)
+		DropsTotal.WithLabelValues(q.class, string(DropCoDel)).Inc()
+		Depth.WithLabelValues(q.class).Set(float64(q.ll.Len()))
+		q.logger.Warn("item dropped by CoDel", zap.Duration("sojourn", soj))
+		return it, DropCoDel, false
 	}
 
-	return item, "", true
-
+	q.ll.Remove(front)
+	Depth.WithLabelValues(q.class).Set(float64(q.ll.Len()))
+	return it, "", true
 }
 
-func (cq *ClassQueue) ReQueue(item Item) {
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	defer cq.refreshDeptMetrics()
+func (q *ClassQueue) Requeue(it Item) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-	if cq.close {
-		DropTotals.WithLabelValues(cq.class, string(DropOverFlow)).Inc()
-		cq.logger.Warn("requeue rejected, queue closed")
-
+	if q.close {
+		DropsTotal.WithLabelValues(q.class, string(DropOverflow)).Inc()
+		q.logger.Warn("requeue rejected, queue closed")
 		return
 	}
 
-	if cq.limit == cq.items.Len() {
-		DropTotals.WithLabelValues(cq.class, string(DropOverFlow)).Inc()
-		cq.logger.Warn("requeue rejected, queue full", zap.Int("limit", cq.limit))
+	if q.ll.Len() == q.limit {
+		DropsTotal.WithLabelValues(q.class, string(DropOverflow)).Inc()
+		q.logger.Warn("requeue rejected, queue full", zap.Int("limit", q.limit))
 		return
 	}
 
-	cq.items.PushFront(item)
+	q.ll.PushFront(it)
+	Depth.WithLabelValues(q.class).Set(float64(q.ll.Len()))
 }
 
-func (cq *ClassQueue) Close() []Item {
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	defer cq.refreshDeptMetrics()
-
-	cq.close = true
+func (q *ClassQueue) Close() []Item {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.close = true
 
 	var items []Item
 
-	for e := cq.items.Front(); e != nil; e = e.Next() {
+	for e := q.ll.Front(); e != nil; e = e.Next() {
 		it := e.Value.(Item)
-
 		items = append(items, it)
 	}
 
-	cq.logger.Info("queue closed", zap.Int("drained_items", len(items)))
-
-	cq.items.Init()
+	q.logger.Info("queue closed", zap.Int("drained_items", len(items)))
+	q.ll.Init()
+	Depth.WithLabelValues(q.class).Set(float64(q.ll.Len()))
 	return items
 }
 
-func (cq *ClassQueue) Len() int {
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-
-	return cq.items.Len()
-}
-
-func (cq *ClassQueue) refreshDeptMetrics() {
-	Depth.WithLabelValues(cq.class).Set(float64(cq.items.Len()))
+func (q *ClassQueue) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.ll.Len()
 }

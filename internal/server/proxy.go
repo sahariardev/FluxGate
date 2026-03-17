@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sahariardev/fluxGate/internal/control"
+	"github.com/sahariardev/fluxGate/internal/queue"
 	"github.com/sahariardev/fluxGate/internal/telemetry/logging"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -109,7 +110,7 @@ func NewProxyServer(options Options, logger *zap.Logger) *ProxyServer {
 	return &ProxyServer{
 		options:   options,
 		conns:     make(map[net.Conn]struct{}),
-		limiter:   control.NewLimit(options.MaxInflight),
+		limiter:   control.NewLimit(int32(options.MaxInflight)),
 		logger:    logging.WithComponent(logger, "proxy"),
 		scheduler: queue.NewScheduler(options.SchedulerCfg, logger),
 		workReady: make(chan struct{}, options.WorkerCount),
@@ -271,8 +272,8 @@ func (s *ProxyServer) worker(ctx context.Context) {
 				continue
 			}
 
-			if admitted {
-				break
+			if !admitted {
+				break // nothing in the queues; wait for next workReady signal
 			}
 
 			if !s.limiter.TryAcquire() {

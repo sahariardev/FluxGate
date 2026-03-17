@@ -1,6 +1,10 @@
 package queue
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 var (
 	Depth = prometheus.NewGaugeVec(
@@ -12,36 +16,39 @@ var (
 	)
 	WaitSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "proxy_queue_wait_seconds",
-			Help: "Current queue wait seconds per class",
+			Name:    "proxy_queue_wait_seconds",
+			Help:    "Current queue wait seconds per class",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"class"},
 	)
-	DropTotals = prometheus.NewCounterVec(
+	DropsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "proxy_queue_drops_total",
 			Help: "Total number of dropped packets",
 		},
-		[]string{"class"},
+		[]string{"class", "reason"},
 	)
 	SchedAdmissions = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "proxy_queue_schd_admissions",
+			Name: "proxy_queue_sched_admissions",
 			Help: "Number of schedules admitted",
 		},
-		[]string{"class", "reason"},
+		[]string{"class"},
 	)
 )
 
-func RegisterMetrics() {
-	prometheus.MustRegister(Depth, WaitSeconds, DropTotals, SchedAdmissions)
+var registerOnce sync.Once
 
-	for _, c := range [] string{"gold", "standerd", "background"} {
-		Depth.WithLabelValues(c).Set(0)
-		WaitSeconds.WithLabelValues(c).Observe(0)
-		DropTotals.WithLabelValues(c, "Overflow").Add(0)
-		DropTotals.WithLabelValues(c, "CoDel").Add(0)
-		SchedAdmissions.WithLabelValues(c).Add(0)
-	}
+func RegisterMetrics() {
+	registerOnce.Do(func() {
+		prometheus.MustRegister(Depth, WaitSeconds, DropsTotal, SchedAdmissions)
+		for _, c := range []string{"gold", "standard", "background"} {
+			Depth.WithLabelValues(c).Set(0)
+			WaitSeconds.WithLabelValues(c).Observe(0)
+			DropsTotal.WithLabelValues(c, "Overflow").Add(0)
+			DropsTotal.WithLabelValues(c, "CoDel").Add(0)
+			SchedAdmissions.WithLabelValues(c).Add(0)
+		}
+	})
 }
