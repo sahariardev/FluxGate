@@ -57,6 +57,11 @@ type Options struct {
 	UpstreamAddr string
 
 	MaxInflight int
+
+	WorkerCount  int
+	DefaultClass string
+	QueueParams  map[string]queue.Params
+	SchedulerCfg queue.Config
 }
 
 type ProxyServer struct {
@@ -68,14 +73,58 @@ type ProxyServer struct {
 	shutdown int32
 	limiter  *control.Limit
 	logger   *zap.Logger
+
+	queues    map[string]*queue.ClassQueue
+	scheduler *queue.Scheduler
+	workReady chan struct{}
 }
 
 func NewProxyServer(options Options, logger *zap.Logger) *ProxyServer {
+	if options.DefaultClass == "" {
+		options.DefaultClass = "standard"
+	}
+
+	if options.WorkerCount <= 0 {
+		options.WorkerCount = options.MaxInflight
+	}
+
+	if options.WorkerCount <= 0 {
+		options.WorkerCount = 64
+	}
+
+	classes := []string{"gold", "standard", "background"}
+	queues := make(map[string]*queue.ClassQueue, len(classes))
+
+	for _, cls := range classes {
+		params, ok := options.QueueParams[cls]
+
+		if !ok {
+			params = defaultQueueParams(cls)
+		}
+		queues[cls] = queue.New(params, logger)
+	}
+
+	queue.RegisterMetrics()
+
 	return &ProxyServer{
-		options: options,
-		conns:   make(map[net.Conn]struct{}),
-		limiter: control.NewLimit(int32(options.MaxInflight)),
-		logger:  logging.WithComponent(logger, "proxy"),
+		options:   options,
+		conns:     make(map[net.Conn]struct{}),
+		limiter:   control.NewLimit(options.MaxInflight),
+		logger:    logging.WithComponent(logger, "proxy"),
+		scheduler: queue.NewScheduler(options.SchedulerCfg, logger),
+		workReady: make(chan struct{}, options.WorkerCount),
+		queues:    queues,
+	}
+}
+
+func defaultQueueParams(cls string) queue.Params {
+	switch cls {
+	case "gold":
+		return queue.Params{Limit: 1000, CoDelTarget: 30 * time.Millisecond, CoDelInterval: 100 * time.Millisecond, Class: cls}
+	case "standard":
+		return queue.Params{Limit: 500, CoDelTarget: 20 * time.Millisecond, CoDelInterval: 100 * time.Millisecond, Class: cls}
+	default:
+		return queue.Params{Limit: 200, CoDelTarget: 10 * time.Millisecond, CoDelInterval: 100 * time.Millisecond, Class: cls}
 	}
 }
 
@@ -105,6 +154,11 @@ func (s *ProxyServer) Run(ctx context.Context) error {
 			s.logger.Warn("failed to close listener", zap.Error(err))
 		}
 	}()
+
+	for i := 0; i < s.options.WorkerCount; i++ {
+		s.wg.Add(1)
+		go s.worker(ctx)
+	}
 
 	var tempDelay time.Duration
 	for {
@@ -138,39 +192,33 @@ func (s *ProxyServer) Run(ctx context.Context) error {
 			continue
 		}
 
-		if !s.limiter.TryAcquire() {
-			metricsRejectedTotal.WithLabelValues("rejected").Inc()
-			//write response message to connection
-			_ = conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
-			_, _ = conn.Write([]byte("proxy busy\n\n"))
-			_ = conn.Close()
+		cls := s.classify(conn)
 
+		item := queue.Item{
+			Class:    cls,
+			Enqueued: time.Now(),
+			Conn:     conn,
+		}
+
+		q, ok := s.queues[cls]
+
+		if !ok {
+			_ = conn.Close()
 			continue
 		}
 
-		metricAdmissionTotal.Inc()
-		metricInflightCurrent.Set(float64(s.limiter.Size()))
+		if !q.Enqueue(item) {
+			metricsRejectedTotal.WithLabelValues("queue_full").Inc()
+			_ = conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+			_, _ = conn.Write([]byte("proxy busy\n\n"))
+			_ = conn.Close()
+			continue
+		}
 
-		tempDelay = 0
-		s.wg.Add(1)
-		s.mu.Lock()
-		s.conns[conn] = struct{}{}
-		s.mu.Unlock()
-
-		go func(c net.Conn) {
-			defer s.wg.Done()
-			defer func() {
-				s.limiter.Release()
-				metricInflightCurrent.Set(float64(s.limiter.Size()))
-
-				s.mu.Lock()
-				delete(s.conns, c)
-				s.mu.Unlock()
-
-				_ = c.Close()
-			}()
-			s.handleConnection(ctx, c)
-		}(conn)
+		select {
+		case s.workReady <- struct{}{}:
+		default:
+		}
 	}
 
 	//shutting down server
@@ -196,12 +244,87 @@ func (s *ProxyServer) Run(ctx context.Context) error {
 	return nil
 }
 
+func (s *ProxyServer) classify(_ net.Conn) string {
+	return s.options.DefaultClass
+}
+
+func (s *ProxyServer) worker(ctx context.Context) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.workReady:
+		}
+
+		for {
+			item, admitted, codelDrop := s.scheduler.Next(s.queues, time.Now())
+
+			if codelDrop {
+				if conn, ok := item.Conn.(net.Conn); ok && conn != nil {
+					metricsRejectedTotal.WithLabelValues("codel").Inc()
+					_ = conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+					_, _ = conn.Write([]byte("dropped\n\n"))
+					_ = conn.Close()
+				}
+
+				continue
+			}
+
+			if admitted {
+				break
+			}
+
+			if !s.limiter.TryAcquire() {
+				s.queues[item.Class].Requeue(item)
+				metricsRejectedTotal.WithLabelValues("inflight_full").Inc()
+				select {
+				case s.workReady <- struct{}{}:
+				default:
+				}
+				break
+			}
+
+			conn := item.Conn.(net.Conn)
+			metricAdmissionTotal.Inc()
+			metricInflightCurrent.Set(float64(s.limiter.Size()))
+
+			s.mu.Lock()
+			s.conns[conn] = struct{}{}
+			s.mu.Unlock()
+
+			s.wg.Add(1)
+			go func(c net.Conn) {
+				defer s.wg.Done()
+				defer func() {
+					s.limiter.Release()
+					metricInflightCurrent.Set(float64(s.limiter.Size()))
+					s.mu.Lock()
+					delete(s.conns, c)
+					s.mu.Unlock()
+					_ = c.Close()
+				}()
+				s.handleConnection(ctx, c)
+			}(conn)
+		}
+	}
+}
+
 func (s *ProxyServer) forceCloseAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for c := range s.conns {
 		_ = c.Close()
+	}
+
+	for _, q := range s.queues {
+		unserved := q.Close()
+		for _, it := range unserved {
+			if conn, ok := it.Conn.(net.Conn); ok && conn != nil {
+				_ = conn.Close()
+			}
+		}
 	}
 }
 
